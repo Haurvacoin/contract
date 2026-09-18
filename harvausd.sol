@@ -3,130 +3,126 @@
 pragma solidity ^0.8.27;
 
 /*
-    ========================================================================
-                           HAURVA PROTOCOL
-                               HAUSD
-    ========================================================================
+    ================================================================
+                         HAURVA PROTOCOL
+                              HAUSD
+    ================================================================
 
-    HAUSD is a BNB-backed USD stablecoin.
+    HAUSD is a BNB-backed, oracle-priced stablecoin.
 
-    TARGET:
-        1 HAUSD = 1 USD
+    CORE IDEA
+    ---------
+    1. A user sends BNB/tBNB to mint().
+    2. The contract reads the current BNB/USD price from Chainlink.
+    3. The deposited BNB (minus the 0.05% minting fee) is valued in USD.
+    4. The contract mints exactly that USD value in HAUSD.
+    5. When redeeming, HAUSD is burned.
+    6. The contract sends the corresponding amount of BNB back to
+       the user using the current Chainlink BNB/USD price.
 
-    COLLATERAL:
-        BNB
-
-    PRICE ORACLE:
-        Chainlink BNB/USD
-
-    HAUSD DECIMALS:
-        6
-
-    MINT FEE:
-        0.05% in BNB
-
-    ------------------------------------------------------------------------
-    IMPORTANT DESIGN
-    ------------------------------------------------------------------------
-
-    Native BNB cannot be pulled directly from a user's wallet by a
-    smart contract.
-
-    Therefore, this contract uses a two-step system:
-
-        STEP 1:
-            User deposits BNB into the contract.
-
-        STEP 2:
-            User calls:
-
-                mint(HAUSD amount)
-
-            The contract automatically calculates how much of the user's
-            deposited BNB is required.
+    DECIMALS
+    --------
+    HAUSD uses 6 decimals.
 
     Example:
 
         BNB price = $600
 
-        User deposits:
-            1 BNB
+        User sends 1 BNB
+        Mint fee = 0.05%
+        Collateral = approximately 0.999500249875 BNB
 
-        User calls:
+        HAUSD minted ≈ 599.700149925 HAUSD
 
-            mint(100000000)
+    If the user wants exactly the equivalent of 0.1 BNB of collateral,
+    they need to send approximately 0.100050025 BNB because the 0.05%
+    fee is charged in addition to the collateral amount.
 
-        This means:
+    FEES
+    ----
+    Mint fee:
+        0.05% = 5 basis points
 
-            100 HAUSD
+    The minting fee is immediately transferred to the contract owner
+    (the administrator wallet).
 
-        The contract calculates:
+    There is currently NO redemption fee.
 
-            100 HAUSD = $100
-            $100 / $600 = 0.166666... BNB
+    ORACLE
+    ------
+    Chainlink BNB/USD Price Feed.
 
-        Minting fee:
+    BSC Testnet:
+        0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526
 
-            0.166666... * 0.05%
-            = 0.00008333... BNB
+    BSC Mainnet:
+        0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE
 
-        Total deducted:
+    Both feeds use 8 decimals.
 
-            approximately 0.16675 BNB
+    NETWORKS
+    --------
+    BSC Testnet:
+        Chain ID 97
 
-        User's remaining deposited balance:
+    BSC Mainnet:
+        Chain ID 56
 
-            approximately 0.83325 BNB
+    The constructor automatically selects the correct oracle according
+    to block.chainid.
 
-    ------------------------------------------------------------------------
-    REDEMPTION
-    ------------------------------------------------------------------------
+    LOGO
+    ----
+    Project artwork:
 
-    When the user calls:
+    https://github.com/Haurvacoin/artwork/blob/main/haurvacoin.png?raw=true
 
-        redeem(HAUSD amount)
+    IMPORTANT
+    ---------
+    This contract does NOT magically force HAUSD to trade at exactly
+    $1 on PancakeSwap or another external market.
 
-    the contract:
+    Instead, minting and redemption are always performed against the
+    Chainlink BNB/USD oracle at approximately $1 per HAUSD.
 
-        1. Reads the current BNB/USD price.
-        2. Calculates the BNB represented by the HAUSD.
-        3. Burns the HAUSD.
-        4. Returns the corresponding BNB.
-        5. Reduces the user's deposited collateral balance.
+    This creates the on-chain arbitrage mechanism around the $1 target.
 
-    ------------------------------------------------------------------------
-    IMPORTANT ECONOMIC NOTE
-    ------------------------------------------------------------------------
-
-    The Chainlink oracle determines the BNB/USD conversion.
-
-    It does NOT force HAUSD to trade at exactly $1 on external exchanges.
-
-    For example, HAUSD could theoretically trade at $0.98 or $1.02 on
-    a DEX.
-
-    The mint/redeem mechanism itself nevertheless treats:
-
-        1 HAUSD = $1
-
-    according to the oracle.
-
-    ------------------------------------------------------------------------
+    SECURITY
+    --------
+    - Oracle price must be positive.
+    - Oracle data must not be stale.
+    - HAUSD cannot be minted without BNB collateral.
+    - BNB can only enter through mint().
+    - Redemption burns HAUSD before sending BNB.
+    - Native BNB transfers use a low-level call.
+    - No unnecessary ReentrancyGuard is used to keep gas usage low;
+      state changes occur before the external BNB transfer.
+    ================================================================
 */
+
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {
+    ERC20Burnable
+} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import {
+    ERC20Permit
+} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 
 
 /*
-    ========================================================================
-                        CHAINLINK PRICE FEED INTERFACE
-    ========================================================================
+    ================================================================
+                       CHAINLINK ORACLE INTERFACE
+    ================================================================
+
+    We define only the part of Chainlink's AggregatorV3Interface
+    that this contract actually needs.
+
+    This avoids importing the entire Chainlink package and keeps the
+    contract simpler to deploy in Remix.
 */
-
-interface AggregatorV3Interface {
-
-    function decimals()
-        external
-        view
-        returns (uint8);
+interface IChainlinkAggregator {
+    function decimals() external view returns (uint8);
 
     function latestRoundData()
         external
@@ -142,273 +138,194 @@ interface AggregatorV3Interface {
 
 
 /*
-    ========================================================================
-                         OPENZEPPELIN IMPORTS
-    ========================================================================
+    ================================================================
+                         HAURVA PROTOCOL
+    ================================================================
 */
-
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {
-    ERC20Burnable
-} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
-import {
-    ERC20Permit
-} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
-import {
-    ReentrancyGuard
-} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {
-    Pausable
-} from "@openzeppelin/contracts/utils/Pausable.sol";
-
-
-/*
-    ========================================================================
-                           HAURVA PROTOCOL
-    ========================================================================
-*/
-
-contract HaurvaProtocol is
-    ERC20,
-    ERC20Burnable,
-    Ownable,
-    ERC20Permit,
-    ReentrancyGuard,
-    Pausable
-{
+contract HaurvaProtocol is ERC20, ERC20Burnable, Ownable, ERC20Permit {
 
     /*
-        ====================================================================
-                              CONSTANTS
-        ====================================================================
+        ------------------------------------------------------------
+                           CONSTANTS
+        ------------------------------------------------------------
     */
 
-    /*
-        HAUSD uses 6 decimals.
-
-        Therefore:
-
-            1 HAUSD
-                =
-            1,000,000 internal units
-    */
+    // HAUSD always uses 6 decimal places.
     uint8 private constant HAUSD_DECIMALS = 6;
 
+    // Chainlink BNB/USD feeds use 8 decimal places.
+    uint256 private constant ORACLE_DECIMALS = 8;
+
+    // 10^18 represents one BNB in native EVM units (wei).
+    uint256 private constant BNB_DECIMALS = 18;
+
+    // 1 USD represented using HAUSD's 6 decimals.
+    uint256 private constant USD_SCALE = 1e6;
 
     /*
-        Minting fee = 0.05%.
+        Minting fee:
 
-        Basis points:
-
-            10000 = 100%
-            5     = 0.05%
+        0.05%
+        =
+        5 / 10,000
+        =
+        0.0005
     */
     uint256 public constant MINT_FEE_BPS = 5;
-
-
-    /*
-        Basis-point denominator.
-    */
     uint256 private constant BPS_DENOMINATOR = 10_000;
 
-
     /*
-        Maximum acceptable oracle age.
+        Chainlink BNB/USD price feeds.
 
-        If Chainlink has not updated for more than one hour,
-        minting and redemption are stopped.
+        These addresses are hardcoded so users cannot replace the
+        oracle with an arbitrary address.
 
-        This is a conservative test/prototype setting.
+        BSC Testnet feed:
+        0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526
+
+        BSC Mainnet feed:
+        0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE
     */
-    uint256 public constant MAX_ORACLE_DELAY = 1 hours;
-
-
-    /*
-        BSC Mainnet chain ID.
-    */
-    uint256 private constant BSC_MAINNET_CHAIN_ID = 56;
-
-
-    /*
-        BSC Testnet chain ID.
-    */
-    uint256 private constant BSC_TESTNET_CHAIN_ID = 97;
-
-
-    /*
-        Chainlink BNB/USD feed on BSC Mainnet.
-    */
-    address private constant MAINNET_BNB_USD =
-        0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
-
-
-    /*
-        Chainlink BNB/USD feed on BSC Testnet.
-    */
-    address private constant TESTNET_BNB_USD =
+    address private constant BSC_TESTNET_BNB_USD =
         0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526;
 
+    address private constant BSC_MAINNET_BNB_USD =
+        0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
 
     /*
-        ====================================================================
-                             STATE VARIABLES
-        ====================================================================
+        Maximum acceptable age of oracle data.
+
+        If Chainlink has not updated the BNB/USD price for more than
+        1 day, minting and redemption are stopped rather than using
+        potentially stale pricing.
+
+        This is a safety mechanism.
+    */
+    uint256 public constant MAX_ORACLE_DELAY = 1 days;
+
+
+    /*
+        ------------------------------------------------------------
+                           STATE VARIABLES
+        ------------------------------------------------------------
     */
 
     /*
-        The Chainlink BNB/USD oracle selected automatically according
-        to the network on which the contract is deployed.
+        The Chainlink BNB/USD oracle selected automatically during
+        deployment according to the network's chain ID.
     */
-    AggregatorV3Interface public immutable bnbUsdFeed;
+    IChainlinkAggregator public immutable bnbUsdOracle;
 
 
     /*
-        User BNB balances.
-
-        This records how much BNB each user has deposited into the
-        protocol and has not yet been used as collateral for minted HAUSD.
-
-        Example:
-
-            user deposits 1 BNB
-
-            depositedBNB[user]
-                =
-            1 BNB
-    */
-    mapping(address => uint256) public depositedBNB;
-
-
-    /*
-        Total BNB currently deposited by all users.
-
-        This is accounting data and should correspond to the collateral
-        held by the contract, excluding protocol fees.
-    */
-    uint256 public totalDepositedBNB;
-
-
-    /*
-        ====================================================================
-                                  EVENTS
-        ====================================================================
+        ------------------------------------------------------------
+                              EVENTS
+        ------------------------------------------------------------
     */
 
     /*
-        Emitted when a user deposits BNB.
-    */
-    event BNBDeposited(
-        address indexed user,
-        uint256 amount
-    );
+        Emitted whenever someone mints HAUSD.
 
+        bnbCollateral:
+            Amount of BNB actually retained by the protocol as
+            collateral.
 
-    /*
-        Emitted when a user withdraws unused BNB.
-    */
-    event BNBWithdrawn(
-        address indexed user,
-        uint256 amount
-    );
+        fee:
+            BNB minting fee paid to the administrator.
 
-
-    /*
-        Emitted when HAUSD is minted.
+        hausdMinted:
+            Number of HAUSD tokens created.
     */
     event HAUSDMinted(
         address indexed user,
-        uint256 hausdAmount,
-        uint256 collateralBNB,
-        uint256 feeBNB,
+        uint256 bnbCollateral,
+        uint256 fee,
+        uint256 hausdMinted,
         uint256 bnbUsdPrice
     );
 
 
     /*
-        Emitted when HAUSD is redeemed.
+        Emitted whenever HAUSD is redeemed for BNB.
     */
     event HAUSDRedeemed(
         address indexed user,
-        uint256 hausdAmount,
-        uint256 collateralBNB,
+        uint256 hausdBurned,
+        uint256 bnbReturned,
         uint256 bnbUsdPrice
     );
 
 
     /*
-        Emitted when the owner withdraws protocol fees.
+        ------------------------------------------------------------
+                           CUSTOM ERRORS
+        ------------------------------------------------------------
     */
-    event FeesWithdrawn(
-        address indexed owner,
-        uint256 amount
-    );
+
+    error UnsupportedNetwork();
+    error NoBNBSent();
+    error InvalidOraclePrice();
+    error OraclePriceStale();
+    error InvalidOracleAnswer();
+    error ZeroHAUSDAmount();
+    error InsufficientBNBReserve();
+    error BNBSendFailed();
+    error DirectBNBTransferDisabled();
 
 
     /*
-        ====================================================================
-                               CONSTRUCTOR
-        ====================================================================
+        ------------------------------------------------------------
+                           CONSTRUCTOR
+        ------------------------------------------------------------
     */
 
     /*
-        initialOwner:
-            Your administrative wallet.
+        The deployer's wallet becomes the administrator.
 
-        The constructor automatically selects the correct Chainlink
-        oracle based on block.chainid.
+        No constructor argument is necessary.
 
-        BSC Testnet:
+        On BSC Testnet:
             Chain ID 97
+            Test BNB oracle is selected.
 
-        BSC Mainnet:
+        On BSC Mainnet:
             Chain ID 56
+            Mainnet BNB oracle is selected.
+
+        Deployment on another chain intentionally fails.
     */
-    constructor(address initialOwner)
+    constructor()
         ERC20("Haurva Protocol", "HAUSD")
-        Ownable(initialOwner)
+        Ownable(msg.sender)
         ERC20Permit("Haurva Protocol")
     {
-
-        /*
-            Automatically select the correct BNB/USD oracle.
-        */
-        if (block.chainid == BSC_MAINNET_CHAIN_ID) {
-
-            bnbUsdFeed =
-                AggregatorV3Interface(MAINNET_BNB_USD);
-
-        } else if (block.chainid == BSC_TESTNET_CHAIN_ID) {
-
-            bnbUsdFeed =
-                AggregatorV3Interface(TESTNET_BNB_USD);
-
-        } else {
-
-            /*
-                Prevent deployment on an unsupported network.
-
-                This protects against accidentally deploying the
-                contract somewhere where these oracle addresses are
-                meaningless.
-            */
-            revert("Unsupported BSC network");
+        if (block.chainid == 97) {
+            bnbUsdOracle =
+                IChainlinkAggregator(BSC_TESTNET_BNB_USD);
+        }
+        else if (block.chainid == 56) {
+            bnbUsdOracle =
+                IChainlinkAggregator(BSC_MAINNET_BNB_USD);
+        }
+        else {
+            revert UnsupportedNetwork();
         }
     }
 
 
     /*
-        ====================================================================
-                              ERC20 DECIMALS
-        ====================================================================
-    */
+        ------------------------------------------------------------
+                           ERC20 DECIMALS
+        ------------------------------------------------------------
 
-    /*
-        HAUSD uses 6 decimals instead of the ERC20 default of 18.
+        HAUSD deliberately uses 6 decimals instead of the ERC20
+        default of 18.
 
         Therefore:
 
-            1 HAUSD = 1,000,000 units
+            1 HAUSD  = 1,000,000 units
+
+        This is convenient for a USD-denominated stablecoin.
     */
     function decimals()
         public
@@ -421,27 +338,30 @@ contract HaurvaProtocol is
 
 
     /*
-        ====================================================================
-                           GET BNB/USD PRICE
-        ====================================================================
+        ============================================================
+                            ORACLE FUNCTIONS
+        ============================================================
     */
 
     /*
-        Reads the current BNB/USD price from Chainlink.
-
-        The returned value is normalized to 8 decimals.
+        Returns the current Chainlink BNB/USD price.
 
         Example:
 
             BNB = $600
 
-        returns approximately:
+        Chainlink returns:
 
             60000000000
 
-        because:
+        because the oracle uses 8 decimals.
 
-            $600 * 10^8
+        The function rejects:
+
+        - negative prices
+        - zero prices
+        - incomplete oracle rounds
+        - stale oracle data
     */
     function getBNBPrice()
         public
@@ -449,460 +369,313 @@ contract HaurvaProtocol is
         returns (uint256 price)
     {
         (
-            ,
+            uint80 roundId,
             int256 answer,
             ,
             uint256 updatedAt,
-            
-        ) = bnbUsdFeed.latestRoundData();
+            uint80 answeredInRound
+        ) = bnbUsdOracle.latestRoundData();
 
-
-        /*
-            Reject invalid oracle prices.
-        */
-        require(
-            answer > 0,
-            "Invalid oracle price"
-        );
-
-
-        /*
-            Reject stale oracle data.
-
-            If Chainlink has stopped updating, the protocol does not
-            continue minting/redeeming using potentially dangerous
-            outdated pricing.
-        */
-        require(
-            updatedAt > 0 &&
-            block.timestamp - updatedAt <= MAX_ORACLE_DELAY,
-            "Stale oracle price"
-        );
-
-
-        /*
-            Convert Chainlink's native decimal precision to 8 decimals.
-        */
-        uint8 feedDecimals = bnbUsdFeed.decimals();
-
-        uint256 rawPrice = uint256(answer);
-
-
-        if (feedDecimals == 8) {
-
-            price = rawPrice;
-
-        } else if (feedDecimals < 8) {
-
-            price =
-                rawPrice *
-                (10 ** (8 - feedDecimals));
-
-        } else {
-
-            price =
-                rawPrice /
-                (10 ** (feedDecimals - 8));
+        if (answer <= 0) {
+            revert InvalidOraclePrice();
         }
-    }
 
+        if (updatedAt == 0) {
+            revert InvalidOracleAnswer();
+        }
 
-    /*
-        ====================================================================
-                       CALCULATE BNB REQUIRED FOR HAUSD
-        ====================================================================
-    */
+        if (answeredInRound < roundId) {
+            revert InvalidOracleAnswer();
+        }
 
-    /*
-        Converts a HAUSD amount into its BNB value.
-
-        HAUSD:
-            6 decimals
-
-        BNB:
-            18 decimals
-
-        Chainlink:
-            8 decimals
-
-        Example:
-
-            BNB = $600
-
-            100 HAUSD
-                =
-            $100
-
-            $100 / $600
-                =
-            0.166666... BNB
-    */
-    function hausdToBNB(
-        uint256 hausdAmount
-    )
-        public
-        view
-        returns (uint256)
-    {
-        require(
-            hausdAmount > 0,
-            "Amount is zero"
-        );
-
-
-        uint256 bnbPrice = getBNBPrice();
-
+        if (block.timestamp - updatedAt > MAX_ORACLE_DELAY) {
+            revert OraclePriceStale();
+        }
 
         /*
-            Convert HAUSD's 6-decimal representation into BNB's
-            18-decimal representation using the oracle's 8 decimals.
+            Chainlink's BNB/USD feed is expected to use 8 decimals.
+
+            We explicitly verify this so a future incompatible oracle
+            cannot silently break the pricing mathematics.
         */
-        return
-            (hausdAmount * 1e20) /
-            bnbPrice;
+        if (bnbUsdOracle.decimals() != ORACLE_DECIMALS) {
+            revert InvalidOracleAnswer();
+        }
+
+        price = uint256(answer);
     }
 
 
     /*
-        ====================================================================
-                     CALCULATE HAUSD FOR A BNB AMOUNT
-        ====================================================================
+        ============================================================
+                        PRICING CALCULATIONS
+        ============================================================
     */
 
     /*
-        Converts BNB into its equivalent HAUSD value.
+        Converts BNB (wei) into HAUSD (6 decimals).
 
-        This function is useful for frontends and testing.
+        Formula:
+
+            BNB USD value
+            =
+            BNB amount * BNB/USD price
+
+        Scaling:
+
+            BNB has 18 decimals.
+            Oracle has 8 decimals.
+            HAUSD has 6 decimals.
+
+        Therefore:
+
+            HAUSD =
+                bnbWei * oraclePrice
+                / 10^20
 
         Example:
 
             1 BNB
-            BNB = $600
+            BNB price = $600
 
-            => 600 HAUSD
+            1e18 * 600e8 / 1e20
+            =
+            600e6
+
+            =
+            600 HAUSD
     */
-    function bnbToHAUSD(
-        uint256 bnbAmount
-    )
+    function bnbToHAUSD(uint256 bnbAmount)
         public
         view
         returns (uint256)
     {
-        require(
-            bnbAmount > 0,
-            "Amount is zero"
-        );
+        uint256 price = getBNBPrice();
 
-
-        uint256 bnbPrice = getBNBPrice();
-
-
-        /*
-            Convert BNB's 18 decimals into HAUSD's 6 decimals.
-        */
         return
-            (bnbAmount * bnbPrice) /
-            1e20;
+            (bnbAmount * price)
+            / 1e20;
     }
 
 
     /*
-        ====================================================================
-                              DEPOSIT BNB
-        ====================================================================
+        Converts HAUSD (6 decimals) into BNB wei.
+
+        Example:
+
+            600 HAUSD
+            BNB price = $600
+
+            600e6 * 1e20 / 600e8
+            =
+            1e18
+
+            =
+            1 BNB
+    */
+    function hausdToBNB(uint256 hausdAmount)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 price = getBNBPrice();
+
+        return
+            (hausdAmount * 1e20)
+            / price;
+    }
+
+
+    /*
+        ============================================================
+                         MINT QUOTATION
+        ============================================================
     */
 
     /*
-        Deposit BNB into the user's protocol balance.
+        Calculates what happens if the user sends a particular
+        amount of BNB to mint().
 
-        This is the ONLY function where the user needs to specify a
-        payable BNB amount.
+        IMPORTANT:
 
-        After depositing BNB, the user can mint HAUSD without entering
-        another BNB amount.
+        The amount supplied here represents the TOTAL BNB payment.
+
+        The 0.05% fee is taken from that payment.
+
+        The remainder becomes collateral.
 
         Example:
 
             User sends:
+                0.1 BNB
 
-                1 BNB
+            Fee:
+                approximately 0.000049975 BNB
 
-            depositedBNB[user]:
+            Collateral:
+                approximately 0.099950025 BNB
 
-                1 BNB
+        This function is view-only and costs no gas when called
+        off-chain.
     */
-    function depositBNB()
+    function quoteMint(uint256 totalBNB)
+        public
+        view
+        returns (
+            uint256 collateralBNB,
+            uint256 feeBNB,
+            uint256 hausdAmount
+        )
+    {
+        if (totalBNB == 0) {
+            return (0, 0, 0);
+        }
+
+        /*
+            Calculate fee:
+
+                fee = total * 5 / 10,000
+        */
+        feeBNB =
+            (totalBNB * MINT_FEE_BPS)
+            / BPS_DENOMINATOR;
+
+        /*
+            Everything remaining becomes collateral.
+        */
+        collateralBNB = totalBNB - feeBNB;
+
+        /*
+            Convert collateral BNB to HAUSD using the live oracle.
+        */
+        hausdAmount = bnbToHAUSD(collateralBNB);
+    }
+
+
+    /*
+        ============================================================
+                              MINT
+        ============================================================
+    */
+
+    /*
+        Mints HAUSD by depositing native BNB.
+
+        NO ARGUMENT IS REQUIRED.
+
+        The user simply calls:
+
+            mint()
+
+        and attaches BNB/tBNB to the transaction.
+
+        The contract automatically:
+
+            1. Reads the BNB/USD oracle.
+            2. Calculates the 0.05% fee.
+            3. Keeps the remaining BNB as collateral.
+            4. Calculates its USD value.
+            5. Mints the corresponding HAUSD.
+            6. Sends the fee to the administrator.
+
+        This means Remix does NOT need a "hausdAmount" input.
+
+        The only value the user needs to provide is the native BNB
+        transaction Value.
+
+        IMPORTANT:
+
+        Because the fee is taken from the supplied BNB, sending
+        exactly 0.1 BNB does NOT result in the USD value of exactly
+        0.1 BNB being minted.
+
+        If the user wants exactly the collateral value of 0.1 BNB,
+        they should send approximately:
+
+            0.100050025 BNB
+
+        which leaves approximately 0.1 BNB after the 0.05% fee.
+    */
+    function mint()
         external
         payable
-        nonReentrant
-        whenNotPaused
     {
-        require(
-            msg.value > 0,
-            "No BNB sent"
-        );
-
+        if (msg.value == 0) {
+            revert NoBNBSent();
+        }
 
         /*
-            Increase the user's deposited balance.
+            Calculate fee directly from the total amount sent.
         */
-        depositedBNB[msg.sender] += msg.value;
-
+        uint256 fee =
+            (msg.value * MINT_FEE_BPS)
+            / BPS_DENOMINATOR;
 
         /*
-            Increase global collateral accounting.
+            The remainder stays inside this contract as collateral.
         */
-        totalDepositedBNB += msg.value;
-
-
-        emit BNBDeposited(
-            msg.sender,
-            msg.value
-        );
-    }
-
-
-    /*
-        ====================================================================
-                         WITHDRAW UNUSED BNB
-        ====================================================================
-    */
-
-    /*
-        Allows a user to withdraw BNB that has NOT been used to back
-        HAUSD.
-
-        Example:
-
-            User deposits:
-
-                1 BNB
-
-            User mints:
-
-                100 HAUSD
-
-            If 0.16675 BNB was consumed by the minting process,
-
-            the user can withdraw approximately:
-
-                0.83325 BNB
-
-        The user cannot withdraw BNB that is already backing HAUSD.
-    */
-    function withdrawBNB(
-        uint256 amount
-    )
-        external
-        nonReentrant
-        whenNotPaused
-    {
-        require(
-            amount > 0,
-            "Amount is zero"
-        );
-
-
-        require(
-            depositedBNB[msg.sender] >= amount,
-            "Insufficient deposited BNB"
-        );
-
+        uint256 collateral =
+            msg.value - fee;
 
         /*
-            Reduce the user's balance before transferring BNB.
-
-            This follows the checks-effects-interactions pattern.
+            Convert the collateral to HAUSD using the current
+            Chainlink BNB/USD price.
         */
-        depositedBNB[msg.sender] -= amount;
+        uint256 hausdAmount =
+            bnbToHAUSD(collateral);
 
+        if (hausdAmount == 0) {
+            revert ZeroHAUSDAmount();
+        }
 
-        totalDepositedBNB -= amount;
-
+        uint256 price =
+            getBNBPrice();
 
         /*
-            Return BNB to the user.
+            Effects first:
+
+            Mint the HAUSD before performing the external native
+            BNB transfer.
+
+            This minimizes reentrancy risk without adding the
+            gas overhead of ReentrancyGuard.
         */
-        (bool success, ) =
-            payable(msg.sender).call{
-                value: amount
-            }("");
-
-
-        require(
-            success,
-            "BNB transfer failed"
-        );
-
-
-        emit BNBWithdrawn(
-            msg.sender,
-            amount
-        );
-    }
-
-
-    /*
-        ====================================================================
-                              MINT HAUSD
-        ====================================================================
-    */
-
-    /*
-        THIS IS NOW THE SIMPLE USER INTERFACE.
-
-        The user specifies ONLY:
-
-            hausdAmount
-
-        There is NO payable BNB field.
-
-        The required BNB is taken from the user's previously deposited
-        BNB balance.
-
-        Example:
-
-            User has deposited:
-
-                1 BNB
-
-            User wants:
-
-                100 HAUSD
-
-            They simply call:
-
-                mint(100000000)
-
-        The contract automatically calculates:
-
-            collateral BNB
-            +
-            0.05% minting fee
-
-        and deducts that amount from depositedBNB[user].
-
-        This is the cleanest possible native-BNB design while still
-        allowing the user to specify the desired HAUSD amount.
-    */
-    function mint(
-        uint256 hausdAmount
-    )
-        external
-        nonReentrant
-        whenNotPaused
-    {
-        require(
-            hausdAmount > 0,
-            "Amount is zero"
-        );
-
+        _mint(msg.sender, hausdAmount);
 
         /*
-            Calculate the BNB collateral required for the requested
-            amount of HAUSD.
+            The minting fee is sent directly to the administrator.
+
+            The collateral remains in this contract.
         */
-        uint256 collateralBNB =
-            hausdToBNB(hausdAmount);
+        if (fee > 0) {
+            (bool success, ) =
+                payable(owner()).call{value: fee}("");
 
-
-        require(
-            collateralBNB > 0,
-            "Collateral too small"
-        );
-
-
-        /*
-            Calculate the 0.05% minting fee.
-
-            Example:
-
-                1 BNB collateral
-
-                fee =
-                    1 * 5 / 10000
-
-                    =
-                    0.0005 BNB
-        */
-        uint256 feeBNB =
-            (collateralBNB * MINT_FEE_BPS) /
-            BPS_DENOMINATOR;
-
-
-        /*
-            Total amount deducted from the user's deposited BNB.
-        */
-        uint256 totalRequiredBNB =
-            collateralBNB + feeBNB;
-
-
-        /*
-            Make sure the user has enough previously deposited BNB.
-        */
-        require(
-            depositedBNB[msg.sender] >= totalRequiredBNB,
-            "Insufficient deposited BNB"
-        );
-
-
-        /*
-            Deduct the collateral and fee from the user's deposited
-            balance.
-
-            The collateral remains part of totalDepositedBNB because
-            it backs the newly minted HAUSD.
-
-            The fee is removed from totalDepositedBNB because it becomes
-            protocol revenue.
-        */
-        depositedBNB[msg.sender] -= totalRequiredBNB;
-
-
-        /*
-            Only the actual collateral is counted as outstanding
-            collateral.
-
-            The fee becomes protocol revenue.
-        */
-        totalDepositedBNB -= feeBNB;
-
-
-        /*
-            Mint the requested HAUSD.
-
-            There is NO owner-only arbitrary mint function.
-
-            HAUSD can only enter circulation through collateralized minting.
-        */
-        _mint(
-            msg.sender,
-            hausdAmount
-        );
-
+            if (!success) {
+                revert BNBSendFailed();
+            }
+        }
 
         emit HAUSDMinted(
             msg.sender,
+            collateral,
+            fee,
             hausdAmount,
-            collateralBNB,
-            feeBNB,
-            getBNBPrice()
+            price
         );
     }
 
 
     /*
-        ====================================================================
-                             REDEEM HAUSD
-        ====================================================================
+        ============================================================
+                            REDEEM
+        ============================================================
     */
 
     /*
-        Redeem HAUSD for BNB.
+        Burns HAUSD and returns its BNB value.
 
-        User specifies ONLY:
-
-            hausdAmount
+        Input uses HAUSD's 6-decimal representation.
 
         Example:
 
@@ -910,152 +683,97 @@ contract HaurvaProtocol is
 
                 100 HAUSD
 
-            BNB = $600
-
-            User calls:
+            Call:
 
                 redeem(100000000)
 
-            The contract calculates:
+            assuming:
 
-                100 HAUSD
-                    =
-                $100
-                    =
-                ~0.166666 BNB
+                BNB = $600
 
-            HAUSD is burned and the corresponding BNB is returned.
+            The contract returns approximately:
+
+                0.166666666666... BNB
+
+        There is currently NO redemption fee.
     */
-    function redeem(
-        uint256 hausdAmount
-    )
+    function redeem(uint256 hausdAmount)
         external
-        nonReentrant
-        whenNotPaused
     {
-        require(
-            hausdAmount > 0,
-            "Amount is zero"
-        );
-
+        if (hausdAmount == 0) {
+            revert ZeroHAUSDAmount();
+        }
 
         /*
-            Make sure the user owns the HAUSD.
+            Calculate how much BNB corresponds to the HAUSD being
+            redeemed using the current BNB/USD oracle price.
         */
-        require(
-            balanceOf(msg.sender) >= hausdAmount,
-            "Insufficient HAUSD"
-        );
-
-
-        /*
-            Calculate how much BNB the HAUSD represents at the
-            current Chainlink BNB/USD price.
-        */
-        uint256 collateralBNB =
+        uint256 bnbAmount =
             hausdToBNB(hausdAmount);
 
-
-        require(
-            collateralBNB > 0,
-            "Redemption too small"
-        );
-
+        if (bnbAmount == 0) {
+            revert ZeroHAUSDAmount();
+        }
 
         /*
-            Make sure the protocol has enough recorded collateral.
+            Make sure the protocol actually has enough BNB available
+            to honor the redemption.
+
+            This check prevents a failed native BNB transfer.
         */
-        require(
-            totalDepositedBNB >= collateralBNB,
-            "Insufficient collateral"
-        );
+        if (address(this).balance < bnbAmount) {
+            revert InsufficientBNBReserve();
+        }
 
+        uint256 price =
+            getBNBPrice();
 
         /*
-            Make sure the actual contract balance is sufficient.
+            IMPORTANT:
+
+            Burn the user's HAUSD BEFORE sending BNB.
+
+            This is the critical state change that prevents a caller
+            from attempting to redeem the same tokens repeatedly.
         */
-        require(
-            address(this).balance >= collateralBNB,
-            "Insufficient vault balance"
-        );
-
+        _burn(msg.sender, hausdAmount);
 
         /*
-            Burn HAUSD before transferring BNB.
+            Send native BNB to the redeemer.
 
-            This prevents the same HAUSD from being redeemed twice.
-        */
-        _burn(
-            msg.sender,
-            hausdAmount
-        );
-
-
-        /*
-            Remove the redeemed collateral from global accounting.
-        */
-        totalDepositedBNB -= collateralBNB;
-
-
-        /*
-            The redeemed BNB is transferred directly to the user.
-
-            It is NOT necessary to add it back to depositedBNB because
-            the user is receiving it directly into their wallet.
+            call() is used instead of transfer() because transfer()
+            imposes the old 2300-gas stipend and can become fragile
+            with smart-contract wallets.
         */
         (bool success, ) =
-            payable(msg.sender).call{
-                value: collateralBNB
-            }("");
+            payable(msg.sender).call{value: bnbAmount}("");
 
-
-        require(
-            success,
-            "BNB transfer failed"
-        );
-
+        if (!success) {
+            revert BNBSendFailed();
+        }
 
         emit HAUSDRedeemed(
             msg.sender,
             hausdAmount,
-            collateralBNB,
-            getBNBPrice()
+            bnbAmount,
+            price
         );
     }
 
 
     /*
-        ====================================================================
-                          VIEW USER INFORMATION
-        ====================================================================
+        ============================================================
+                         PROTOCOL INFORMATION
+        ============================================================
     */
 
     /*
-        Returns how much BNB the user has deposited and not withdrawn.
+        Returns the amount of BNB currently held by the protocol.
 
-        This is useful for Remix and frontends.
+        This represents the native BNB reserve available for
+        redemption.
     */
-    function userBNBBalance(
-        address user
-    )
-        external
-        view
-        returns (uint256)
-    {
-        return depositedBNB[user];
-    }
-
-
-    /*
-        Returns the actual BNB held by the contract.
-
-        This includes:
-
-            user collateral
-            +
-            protocol fees
-    */
-    function vaultBalance()
+    function bnbReserve()
         external
         view
         returns (uint256)
@@ -1065,170 +783,55 @@ contract HaurvaProtocol is
 
 
     /*
-        ====================================================================
-                         PROTOCOL FEE ACCOUNTING
-        ====================================================================
+        Returns the current theoretical USD value of all HAUSD
+        currently outstanding, according to the oracle.
+
+        Because HAUSD has 6 decimals, totalSupply() / 1e6 gives the
+        human-readable token amount.
     */
-
-    /*
-        Returns the amount of BNB that can theoretically be withdrawn
-        as protocol fees.
-
-        Formula:
-
-            actual vault balance
-                -
-            outstanding user collateral
-    */
-    function accumulatedFees()
-        public
+    function totalHAUSDSupply()
+        external
         view
         returns (uint256)
     {
-        uint256 balance =
-            address(this).balance;
-
-
-        if (balance <= totalDepositedBNB) {
-            return 0;
-        }
-
-
-        return
-            balance - totalDepositedBNB;
+        return totalSupply();
     }
 
 
     /*
-        ====================================================================
-                         WITHDRAW PROTOCOL FEES
-        ====================================================================
+        ============================================================
+                       DIRECT BNB TRANSFERS
+        ============================================================
     */
 
     /*
-        The owner can withdraw accumulated minting fees.
+        Users should NEVER send BNB directly to the contract.
 
-        The owner CANNOT withdraw BNB that is recorded as user
-        collateral.
+        All collateral deposits must go through mint() so that:
 
-        This protects outstanding HAUSD backing.
-    */
-    function withdrawFees(
-        uint256 amount
-    )
-        external
-        onlyOwner
-        nonReentrant
-    {
-        require(
-            amount > 0,
-            "Amount is zero"
-        );
+            - the oracle price is read
+            - the minting fee is calculated
+            - HAUSD is created
 
+        Therefore direct native BNB transfers are rejected.
 
-        require(
-            amount <= accumulatedFees(),
-            "Exceeds available fees"
-        );
+        NOTE:
 
-
-        /*
-            Transfer only protocol revenue.
-        */
-        (bool success, ) =
-            payable(owner()).call{
-                value: amount
-            }("");
-
-
-        require(
-            success,
-            "Fee withdrawal failed"
-        );
-
-
-        emit FeesWithdrawn(
-            owner(),
-            amount
-        );
-    }
-
-
-    /*
-        ====================================================================
-                                PAUSE
-        ====================================================================
-    */
-
-    /*
-        Emergency pause.
-
-        While paused:
-
-            depositBNB()
-            withdrawBNB()
-            mint()
-            redeem()
-
-        are disabled.
-
-        ERC20 transfers continue to function.
-    */
-    function pause()
-        external
-        onlyOwner
-    {
-        _pause();
-    }
-
-
-    /*
-        ====================================================================
-                               UNPAUSE
-        ====================================================================
-    */
-
-    /*
-        Re-enable protocol operations.
-    */
-    function unpause()
-        external
-        onlyOwner
-    {
-        _unpause();
-    }
-
-
-    /*
-        ====================================================================
-                         DIRECT BNB TRANSFERS
-        ====================================================================
-    */
-
-    /*
-        Reject BNB sent directly to the contract.
-
-        Users must use:
-
-            depositBNB()
-
-        so that the contract can correctly record their collateral.
+        A forced BNB transfer through mechanisms such as SELFDESTRUCT
+        cannot be prevented at the EVM level, but ordinary transfers
+        are rejected here.
     */
     receive()
         external
         payable
     {
-        revert("Use depositBNB()");
+        revert DirectBNBTransferDisabled();
     }
 
-
-    /*
-        Reject unknown calls that attempt to send BNB.
-    */
     fallback()
         external
         payable
     {
-        revert("Invalid function");
+        revert DirectBNBTransferDisabled();
     }
 }
